@@ -16,7 +16,7 @@ from pprint import pprint
 # My modules
 import sys, os
 root_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pkg_path = "{}/SewFactory/packages".format(root_path)
+pkg_path = "{}/sewformer/SewFactory/packages".format(root_path)
 sys.path.insert(0, pkg_path) 
 print(pkg_path)
 
@@ -38,7 +38,6 @@ def get_values_from_args():
     parser.add_argument('--local_rank', default=0)
     args = parser.parse_args()
 
-
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -47,15 +46,19 @@ def get_values_from_args():
 if __name__ == '__main__':
     from pprint import pprint 
     np.set_printoptions(precision=4, suppress=True)
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     config, args = get_values_from_args()
     system_info = customconfig.Properties('./system.json')
 
     # DDP
-    dist.init_process_group(backend='nccl')
-    rank = dist.get_rank()
-    print(f"INFO::{__file__}::Start running basic DDP example on rank {rank}.")
-    config['trainer']['multiprocess'] = True
+    if system_info['use_ddp']:
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        print(f"INFO::{__file__}::Start running basic DDP example on rank {rank}.")
+    if not system_info['use_ddp']:
+        rank = 0
+
+    config['trainer']['multiprocess'] = system_info['use_ddp']
 
     experiment = ExperimentWrappper(
         config,  # set run id in cofig to resume unfinished run!

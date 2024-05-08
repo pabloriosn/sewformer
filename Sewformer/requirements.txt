@@ -11,4 +11,4 @@ entmax
 numba
 pytz
 cairosvg
-
+scikit-learn

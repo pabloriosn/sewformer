@@ -1,4 +1,4 @@
-name: garment
+name: sewformer
 channels:
   - conda-forge
   - defaults
