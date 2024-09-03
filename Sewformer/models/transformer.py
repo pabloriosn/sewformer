@@ -23,12 +23,11 @@ class Transformer(nn.Module):
                  return_intermediate_dec=False):
         super().__init__()
 
-        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+        encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
-        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
-                                                dropout, activation, normalize_before)
+        decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                          return_intermediate=return_intermediate_dec)
@@ -45,19 +44,20 @@ class Transformer(nn.Module):
         # flatten NxCxHxW to HWxNxC
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)
-        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
-        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
+        pos_embed = pos_embed.flatten(2).permute(2, 0, 1)           # Positional Embedding
+        query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)     # Panel Query
         mask = mask.flatten(1)
 
         tgt = torch.zeros_like(query_embed)
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        hs = self.decoder(tgt, memory, memory_key_padding_mask=mask, 
-                          pos=pos_embed, query_pos=query_embed)
+        # Transformers encoder: Visual tokens
+        visual_tokens = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
+        # Panel Decoder: Panel tokens
+        hs = self.decoder(tgt, visual_tokens, memory_key_padding_mask=mask, pos=pos_embed, query_pos=query_embed)
         if return_self_attns:
             self_attns = self.encoder.layers[-1].self_attn
         else:
             self_attn = None
-        return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w), self_attn
+        return hs.transpose(1, 2), visual_tokens.permute(1, 2, 0).view(bs, c, h, w), self_attn
 
 
 class TransformerEncoder(nn.Module):
@@ -75,8 +75,7 @@ class TransformerEncoder(nn.Module):
         output = src
 
         for layer in self.layers:
-            output = layer(output, src_mask=mask, 
-                           src_key_padding_mask=src_key_padding_mask, pos=pos) 
+            output = layer(output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos)
         if self.norm is not None:
             output = self.norm(output) 
         
@@ -227,7 +226,7 @@ class TransformerDecoderLayer(nn.Module):
                                    key_padding_mask=memory_key_padding_mask)[0] 
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-        tgt2 = self.linear2(slef.dropout(self.activation(self.linear1(tgt))))
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt) 
         return tgt 
@@ -240,9 +239,11 @@ class TransformerDecoderLayer(nn.Module):
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None):
         tgt2 = self.norm1(tgt)
-        q = k = self.with_pos_embed(tgt2, query_pos)
-        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt2 = self.self_attn(self.with_pos_embed(tgt2, query_pos),
+                              self.with_pos_embed(tgt2, query_pos),
+                              value=tgt2,
+                              attn_mask=tgt_mask, key_padding_mask=tgt_key_padding_mask)[0]
+
         tgt = tgt + self.dropout1(tgt2)
         tgt2 = self.norm2(tgt)
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),

@@ -17,7 +17,7 @@ import torch.nn as nn
 # My modules
 import sys, os
 root_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-pkg_path = "{}/SewFactory/packages".format(root_path)
+pkg_path = "{}/sewformer/SewFactory/packages".format(root_path)
 print(pkg_path)
 sys.path.insert(0, pkg_path)
 
@@ -131,8 +131,10 @@ def is_img_file(fn):
 if __name__ == "__main__":
 
     np.set_printoptions(precision=4, suppress=True)
+    # Load system info from system.json
     system_info = customconfig.Properties('./system.json')
 
+    # Load configuration and arguments from configs/test.yaml
     config, args = get_values_from_args()
 
     shape_experiment = ExperimentWrappper(config, system_info['wandb_username'])  # finished experiment

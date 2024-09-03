@@ -25,37 +25,47 @@ from metrics.composed_loss import ComposedLoss, ComposedPatternLoss
 class GarmentDETRv6(nn.Module):
     def __init__(self, backbone, panel_transformer, num_panel_queries, num_edges, num_joints, **edge_kwargs):
         super().__init__()
+        # CNN backbone
         self.backbone = backbone
-        
-        self.num_panel_queries = num_panel_queries
-        self.num_joint_queries = num_joints
+        # Panel Transformer ( Encoder + Decoder panel)
         self.panel_transformer = panel_transformer
-
         self.hidden_dim = self.panel_transformer.d_model
-
-        self.panel_embed = MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim, 2)
-
-        self.panel_joints_query_embed = nn.Embedding(self.num_panel_queries + self.num_joint_queries, self.hidden_dim)
-
-        self.input_proj = nn.Conv2d(backbone.num_channels, self.hidden_dim, kernel_size=1)
-        self.panel_rt_decoder = MLP(self.hidden_dim, self.hidden_dim, 7, 2)
-        self.joints_decoder = MLP(self.hidden_dim, self.hidden_dim, 6, 2)
-
-        self.num_edges = num_edges
-        self.num_edge_queries = self.num_panel_queries * num_edges
         self.edge_kwargs = edge_kwargs["edge_kwargs"]
 
+        # Edge Decoder
+        self.build_edge_decoder(self.hidden_dim, self.edge_kwargs["nheads"],
+                                self.hidden_dim, self.edge_kwargs["dropout"],
+                                "relu", self.edge_kwargs["pre_norm"],
+                                self.edge_kwargs["dec_layers"])
 
+
+        self.num_panel_queries = num_panel_queries                  # Number of panel queries [23]
+        self.num_joint_queries = num_joints                         # Number of joint queries [22]
+        self.num_edges = num_edges                                  # Number of edges [14]
+        self.num_edge_queries = self.num_panel_queries * num_edges  # Number of edge queries [23*14=322]
+
+        # Convolution 1x1 to reduce the dimension of output of CNN backbone
+        self.input_proj = nn.Conv2d(backbone.num_channels, self.hidden_dim, kernel_size=1)
+
+        # Panel Decoder: Panel Queries [23+22]
+        self.panel_joints_query_embed = nn.Embedding(self.num_panel_queries + self.num_joint_queries, self.hidden_dim)
+        # Panel Decoder: output MLP ( panel + joint tokens)
+        self.panel_embed = MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim, 2)
+
+        # Panel Decoder: MLP for Rotation and Translation
+        self.panel_rt_decoder = MLP(self.hidden_dim, self.hidden_dim, 7, 2)
+        # TODO MLP for Joints
+        self.joints_decoder = MLP(self.hidden_dim, self.hidden_dim, 6, 2)
+
+        # Expanded tokens
         self.panel_decoder = MLP(self.hidden_dim, self.hidden_dim, self.num_edges * 4, 2)
         self.edge_query_mlp = MLP(self.hidden_dim + 4, self.hidden_dim, self.hidden_dim, 1)
-
-        self.build_edge_decoder(self.hidden_dim, self.edge_kwargs["nheads"], 
-                                self.hidden_dim, self.edge_kwargs["dropout"], 
-                                "relu", self.edge_kwargs["pre_norm"], 
-                                self.edge_kwargs["dec_layers"])
         
+        # MLP Edge Decoder
         self.edge_embed = MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim, 2)
+        # MLP
         self.edge_cls = MLP(self.hidden_dim, self.hidden_dim // 2, 1, 2)
+        # MLP to predict edges
         self.edge_decoder = MLP(self.hidden_dim, self.hidden_dim, 4, 2)
 
     def build_edge_decoder(self, d_model, nhead, dim_feedforward, dropout, activation, normalize_before, num_layers):
@@ -72,40 +82,48 @@ class GarmentDETRv6(nn.Module):
     def forward(self, samples, gt_stitches=None, gt_edge_mask=None, return_stitches=False):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
+        # Forward CNN [features = (1,2048,24,24), pos = (1,256,24,24)]
         features, panel_pos = self.backbone(samples)
 
         src, mask = features[-1].decompose()
         B = src.shape[0]
         assert mask is not None
-        panel_joint_hs, panel_memory, _ = self.panel_transformer(self.input_proj(src), mask, self.panel_joints_query_embed.weight, panel_pos[-1])
+        # Panel Transformer [Panel tokens + Joint tokens, Visual Tokens ]
+        panel_joint_hs, visual_tokens, _ = self.panel_transformer(self.input_proj(src), mask, self.panel_joints_query_embed.weight, panel_pos[-1])
+
+        # Output MLP Panel Decoder: Panel tokens + Joint tokens
         panel_joint_hs = self.panel_embed(panel_joint_hs)
-        panel_hs = panel_joint_hs[:, :, :self.num_panel_queries, :]
-        joint_hs = panel_joint_hs[:, :, self.num_panel_queries:, :]
-        output_panel_rt = self.panel_rt_decoder(panel_hs)
+        # Panel tokens matrix, Joint tokens matrix
+        panel_tokens, joint_hs = panel_joint_hs[:, :, :self.num_panel_queries, :], panel_joint_hs[:, :, self.num_panel_queries:, :]
 
-        output_rotations = output_panel_rt[:, :, :, :4]
-        output_translations = output_panel_rt[:, :, :, 4:]
+        # MLP Rotation + translation matrix (Panel Decoder)
+        output_panel_rt = self.panel_rt_decoder(panel_tokens)
+        # Output: Rotation and Translation vectors
+        output_rotations, output_translations = output_panel_rt[:, :, :, :4], output_panel_rt[:, :, :, 4:]
+        out = {"rotations": output_rotations[-1], "translations": output_translations[-1]}
 
-        out = {"rotations": output_rotations[-1], 
-               "translations": output_translations[-1]}
-        
+        # TODO MLP MLP Joints Decoder
         output_joints = self.joints_decoder(joint_hs)
         out.update({"smpl_joints": output_joints[-1]})
 
-        edge_output = self.panel_decoder(panel_hs)[-1].view(B, self.num_panel_queries, self.num_edges, 4)
-        edge_query = self.edge_query_mlp(torch.cat((panel_joint_hs[-1, :, :self.num_panel_queries, :].unsqueeze(2).expand(-1, -1, self.num_edges, -1), edge_output), dim=-1)).reshape(B, -1, self.hidden_dim).permute(1, 0, 2)
+        # Expanded tokens
+        edge_output = self.panel_decoder(panel_tokens)[-1].view(B, self.num_panel_queries, self.num_edges, 4)   # (6, B, 23, 256) -> (B, 23, 14, 4)
+        aux = torch.cat((panel_tokens[-1, :, :, :].unsqueeze(2).expand(-1, -1, self.num_edges, -1), edge_output), dim=-1)
+        # Edge Query: MLP (322, B, 256)
+        edge_query = self.edge_query_mlp(aux).reshape(B, -1, self.hidden_dim).permute(1, 0, 2)
 
+        # Edge Decoder transformer
         tgt = torch.zeros_like(edge_query)
-        memory = panel_memory.view(B, self.hidden_dim, -1).permute(2, 0, 1)         # latten NxCxHxW to HWxNxC
-        edge_hs = self.edge_trans_decoder(tgt, memory, 
+        memory = visual_tokens.view(B, self.hidden_dim, -1).permute(2, 0, 1)         # latten NxCxHxW to HWxNxC
+        edge_hs = self.edge_trans_decoder(tgt, memory,
                                           memory_key_padding_mask=mask.flatten(1), 
                                           query_pos=edge_query).transpose(1, 2)
-        
+        # Edge Tokens
         output_edge_embed = self.edge_embed(edge_hs)[-1]
-
+        # TODO
         output_edge_cls = self.edge_cls(output_edge_embed)
+        # Predicted Edges
         output_edges = self.edge_decoder(output_edge_embed) + edge_output.view(B, -1, 4)
-
 
         out.update({"outlines": output_edges, "edge_cls": output_edge_cls})
 
@@ -352,13 +370,16 @@ class SetCriterionWithOutMatcher(nn.Module):
             
 
 def build(args):
+    # Number of maximum patterns
     num_classes = args["dataset"]["max_pattern_len"]
     devices = torch.device(args["trainer"]["devices"][0] if isinstance(args["trainer"]["devices"], list) else args["trainer"]["devices"])
+    # 4.1.1 Visual Encoder (Resnet + Positional Encoding)
     backbone = build_backbone(args)
+    # 4.1.2 Two-level  Transformer decoder
     panel_transformer = build_transformer(args)
-
+    # SewFormer model
     model = GarmentDETRv6(backbone, panel_transformer, num_classes, 14, 22, edge_kwargs=args["NN"])
-
+    # Loss function
     criterion = SetCriterionWithOutMatcher(args["dataset"], args["NN"]["loss"])
     criterion.to(devices)
     return model, criterion
